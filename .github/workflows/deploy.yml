@@ -1,0 +1,67 @@
+name: Deploy & Benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Tidy
+        run: go mod tidy
+      - name: Prepare SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          install -m 600 /dev/null ~/.ssh/id_ed25519
+          printf "%s" "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null || true
+      - name: Upload deploy script
+        run: |
+          scp -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no scripts/deploy-with-https.sh ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }}:/root/deploy-websocket-relay.sh
+          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }} "chmod +x /root/deploy-websocket-relay.sh"
+      - name: Deploy on server
+        env:
+          DOMAIN: ${{ secrets.DOMAIN }}
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }} \
+            "DOMAIN='${DOMAIN}' SERVER_IP='${SERVER_IP}' PORT='8080' UDP_PORT='8081' /root/deploy-websocket-relay.sh"
+      - name: Remote benchmark (5s)
+        env:
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }} \
+            "cd /opt/websocket-relay && go test -v -run TestFunctional -args -duration=5s -clients=6 -report.json=/root/bench.json -report.md=/root/bench.md -baseURL=https://${DOMAIN}"
+      - name: Download benchmark output
+        run: |
+          scp -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }}:/root/bench.json bench.json
+          scp -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }}:/root/bench.md bench.md
+      - name: Render HTML report
+        run: |
+          mkdir -p site
+          go run ./render.go -in bench.json -out site/${{ github.sha }}.html -title "Bench ${{ github.sha }}"
+          # Also copy as index
+          cp site/${{ github.sha }}.html site/index.html
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+  deploy_pages:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
+
